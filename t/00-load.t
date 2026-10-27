@@ -4,12 +4,12 @@ use strict;
 use warnings FATAL => 'all';
 use Test::More;
 
-plan tests => 4;
+plan tests => 5;
 
 BEGIN {
   use_ok( 'OpenAPI::Generator' ) || print "Bail out!\n";
 
-  for (qw(From::Pod From::Definitions Util)) {
+  for (qw(From::Pod From::Definitions From::Mojolicious Util)) {
     use_ok("OpenAPI::Generator::$_") || print "Bail out!\n"
   }
 }

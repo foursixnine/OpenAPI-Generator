@@ -1,6 +1,7 @@
 Changes
 lib/OpenAPI/Generator.pm
 lib/OpenAPI/Generator/From/Definitions.pm
+lib/OpenAPI/Generator/From/Mojolicious.pm
 lib/OpenAPI/Generator/From/Pod.pm
 lib/OpenAPI/Generator/Util.pm
 Makefile.PL
@@ -9,6 +10,7 @@ README
 README.md
 t/00-load.t
 t/from_definitions.t
+t/from_mojolicious.t
 t/from_pod.t
 t/manifest.t
 t/pod-coverage.t
