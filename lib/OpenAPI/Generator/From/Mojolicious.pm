@@ -4,7 +4,9 @@ use strict;
 use warnings;
 
 use Carp qw(croak);
+use File::Spec;
 use Mojo::JSON qw(true false);
+use Mojo::Util qw(camelize);
 
 my %HTTP_METHODS = map { $_ => 1 } qw(get post put delete patch options head trace);
 
@@ -144,7 +146,7 @@ sub _introspect_routes {
 
     for my $method (@http_methods) {
       my $op = $self->_build_operation(
-        $route, $method, $clean_path, $path_params, $conf, \%seen_op_ids
+        $route, $method, $clean_path, $path_params, $conf, \%seen_op_ids, $spec
       );
       $spec->{paths}{$clean_path}{$method} = $op;
     }
@@ -268,7 +270,7 @@ sub _convert_path_placeholders {
 }
 
 sub _build_operation {
-  my ($self, $route, $method, $clean_path, $path_params, $conf, $seen_op_ids) = @_;
+  my ($self, $route, $method, $clean_path, $path_params, $conf, $seen_op_ids, $spec) = @_;
 
   my $base_path = $conf->{base_path};
 
@@ -327,9 +329,11 @@ sub _build_operation {
 
   # Set x-mojo-to if controller/action target exists
   my $to = $route->to;
+  my ($ctrl_file, $ctrl_pkg);
   if ($to && ref $to eq 'HASH') {
     if ($to->{controller} && $to->{action}) {
       $op{'x-mojo-to'} = "$to->{controller}#$to->{action}";
+      ($ctrl_file, $ctrl_pkg) = $self->_resolve_controller_file($route, $to->{controller}, $conf);
     }
   }
 
@@ -348,6 +352,80 @@ sub _build_operation {
         },
       },
     };
+  }
+
+  # Enrich from controller POD documentation if available
+  if ($ctrl_file && $to && ref $to eq 'HASH' && $to->{action}) {
+    my $pod_data = $self->_parse_controller_pod_file($ctrl_file);
+    if (my $pod = $pod_data->{$to->{action}}) {
+      $op{summary}     //= $pod->{summary} if defined $pod->{summary};
+      $op{description} //= $pod->{description} if defined $pod->{description};
+
+      my $tag = $to->{controller};
+      $tag =~ s/.*:://;
+      $op{tags} //= [ lc $tag ];
+
+      my @options = @{$pod->{options} || []};
+      if (@options) {
+        if ($method =~ m{^(?:get|delete|head)$}i) {
+          $op{parameters} //= [];
+          my %existing = map { ($_->{name} // '') . ':' . ($_->{in} // '') => $_ } @{$op{parameters}};
+          for my $opt (@options) {
+            if (my $p_param = $existing{$opt->{name} . ':path'}) {
+              $p_param->{description} //= $opt->{description} if defined $opt->{description};
+              $p_param->{example}     //= $opt->{example}     if defined $opt->{example};
+              next;
+            }
+            next if $existing{$opt->{name} . ':query'};
+            my %param = (
+              name   => $opt->{name},
+              in     => 'query',
+              schema => { type => $opt->{type} // 'string' },
+            );
+            $param{required}    = true                if $opt->{required};
+            $param{description} = $opt->{description} if defined $opt->{description};
+            $param{example}     = $opt->{example}     if defined $opt->{example};
+            push @{$op{parameters}}, \%param;
+          }
+        }
+        elsif ($method =~ m{^(?:post|put|patch)$}i && $op{requestBody}) {
+          my $content = $op{requestBody}{content} // {};
+          for my $media (keys %$content) {
+            next unless ref $content->{$media} eq 'HASH' && ref $content->{$media}{schema} eq 'HASH';
+            my $schema = $content->{$media}{schema};
+            $schema->{properties} //= {};
+            for my $opt (@options) {
+              my %prop = (
+                type => $opt->{type} // 'string',
+              );
+              $prop{description} = $opt->{description} if defined $opt->{description};
+              $prop{example}     = $opt->{example}     if defined $opt->{example};
+              $schema->{properties}{$opt->{name}} //= \%prop;
+              if ($opt->{required}) {
+                $schema->{required} //= [];
+                push @{$schema->{required}}, $opt->{name}
+                  unless grep { $_ eq $opt->{name} } @{$schema->{required}};
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  # Authentication bridge detection
+  if ($self->_has_auth_bridge($route, $conf)) {
+    my $scheme = $conf->{security_scheme} // 'api_key';
+    $op{security} //= [ { $scheme => [] } ];
+    if ($spec) {
+      $spec->{components} //= {};
+      $spec->{components}{securitySchemes} //= {};
+      $spec->{components}{securitySchemes}{$scheme} //= {
+        type => 'apiKey',
+        name => 'Authorization',
+        in   => 'header',
+      };
+    }
   }
 
   # Merge inline route annotations if provided via ->to(openapi => { ... })
@@ -377,6 +455,223 @@ sub _build_operation {
   }
 
   return \%op;
+}
+
+sub _resolve_controller_file {
+  my ($self, $route, $controller, $conf) = @_;
+
+  return undef unless $controller;
+
+  my @candidates;
+  if ($controller =~ /::/) {
+    push @candidates, $controller;
+  }
+  else {
+    my $camel = camelize($controller);
+    my $namespaces = ($route->root && $route->root->namespaces) ? $route->root->namespaces : [];
+    for my $ns (@$namespaces) {
+      push @candidates, "${ns}::${camel}";
+    }
+    push @candidates, $camel;
+  }
+
+  for my $pkg (@candidates) {
+    my $rel = join('/', split(/::/, $pkg)) . '.pm';
+    if (exists $INC{$rel} && -r $INC{$rel}) {
+      return ($INC{$rel}, $pkg);
+    }
+    my @dirs = @INC;
+    if (my $extra = $conf->{pod_dir} || $conf->{controller_dir}) {
+      unshift @dirs, ref $extra eq 'ARRAY' ? @$extra : ($extra);
+    }
+    for my $dir (@dirs) {
+      next unless defined $dir && length $dir;
+      my $full = File::Spec->catfile($dir, split(/::/, $pkg)) . '.pm';
+      if (-f $full && -r $full) {
+        return ($full, $pkg);
+      }
+    }
+  }
+
+  return undef;
+}
+
+sub _extract_node_text {
+  my ($self, $node) = @_;
+  return '' unless defined $node;
+  return $node unless ref $node;
+  return '' unless ref $node eq 'ARRAY';
+  my $text = '';
+  for my $i (2 .. $#$node) {
+    $text .= $self->_extract_node_text($node->[$i]);
+  }
+  return $text;
+}
+
+sub _parse_controller_pod_file {
+  my ($self, $file) = @_;
+
+  return $self->{_pod_cache}{$file} if exists $self->{_pod_cache}{$file};
+
+  require Pod::Simple::SimpleTree;
+  my $parser = Pod::Simple::SimpleTree->new;
+  my $tree = eval { $parser->parse_file($file)->root };
+  if ($@) {
+    croak "Failed to parse controller POD from '$file': $@";
+  }
+
+  return ($self->{_pod_cache}{$file} = {}) unless $tree && ref $tree eq 'ARRAY';
+
+  my %methods;
+  my $nodes = [ @$tree[2 .. $#$tree] ];
+
+  # Locate METHODS head1 section
+  my $methods_over = undef;
+  my $in_methods = 0;
+  for my $node (@$nodes) {
+    next unless ref $node eq 'ARRAY';
+    my $tag = $node->[0] // '';
+    if ($tag eq 'head1') {
+      my $txt = $self->_extract_node_text($node);
+      $in_methods = ($txt =~ m{^\s*METHODS\s*$}i) ? 1 : 0;
+    }
+    elsif ($in_methods && ($tag eq 'over-text' || $tag eq 'over-bullet')) {
+      $methods_over = $node;
+      last;
+    }
+  }
+
+  # Fallback to first over block in document if no head1 METHODS
+  if (!$methods_over) {
+    for my $node (@$nodes) {
+      if (ref $node eq 'ARRAY' && ($node->[0] eq 'over-text' || $node->[0] eq 'over-bullet')) {
+        $methods_over = $node;
+        last;
+      }
+    }
+  }
+
+  if ($methods_over) {
+    my $cur_action = undef;
+    my $children = [ @$methods_over[2 .. $#$methods_over] ];
+
+    for my $child (@$children) {
+      next unless ref $child eq 'ARRAY';
+      my $ctag = $child->[0] // '';
+
+      if ($ctag eq 'item-text') {
+        my $txt = $self->_extract_node_text($child);
+        if ($txt =~ /^\s*(\w+)(?:\s*\(\s*\))?\s*$/) {
+          $cur_action = $1;
+          $methods{$cur_action} = {
+            summary     => undef,
+            description => undef,
+            options     => [],
+            _paras      => [],
+          };
+        }
+        else {
+          $cur_action = undef;
+        }
+      }
+      elsif ($cur_action) {
+        if ($ctag eq 'over-text' || $ctag eq 'over-bullet') {
+          my $cur_opt = undef;
+          my $opt_children = [ @$child[2 .. $#$child] ];
+
+          for my $opt_node (@$opt_children) {
+            next unless ref $opt_node eq 'ARRAY';
+            my $otag = $opt_node->[0] // '';
+
+            if ($otag eq 'item-text') {
+              my $opt_name = $self->_extract_node_text($opt_node);
+              $opt_name =~ s/^\s+|\s+$//g;
+              my $req = ($opt_name =~ s/\s*\((?:required|mandatory)\)\s*$//i) ? 1 : 0;
+              $cur_opt = {
+                name        => $opt_name,
+                type        => 'string',
+                description => undef,
+                example     => undef,
+                required    => $req,
+              };
+              push @{$methods{$cur_action}{options}}, $cur_opt;
+            }
+            elsif ($cur_opt && $otag eq 'Verbatim') {
+              my $verb = $self->_extract_node_text($opt_node);
+              if ($verb =~ /=>\s*(.+)$/m) {
+                my $val = $1;
+                $val =~ s/^\s+|\s+$//g;
+                if ($val =~ /^['"](.*)['"]$/) {
+                  $cur_opt->{type} = 'string';
+                  $cur_opt->{example} = $1;
+                }
+                elsif ($val =~ /^-?\d+$/) {
+                  $cur_opt->{type} = 'integer';
+                  $cur_opt->{example} = int($val);
+                }
+                elsif ($val =~ /^-?\d+\.\d+$/) {
+                  $cur_opt->{type} = 'number';
+                  $cur_opt->{example} = 0 + $val;
+                }
+              }
+            }
+            elsif ($cur_opt && $otag eq 'Para') {
+              my $p_text = $self->_extract_node_text($opt_node);
+              $p_text =~ s/^\s+|\s+$//g;
+              $cur_opt->{description} = $p_text;
+              if ($p_text =~ /\b(?:mandatory|required)\b/i && $p_text !~ /\b(?:not\s+(?:mandatory|required)|optional)\b/i) {
+                $cur_opt->{required} = 1;
+              }
+              if ($p_text =~ /\b(?:0\s+or\s+1|boolean)\b/i && $cur_opt->{type} ne 'string') {
+                $cur_opt->{type} = 'integer';
+              }
+            }
+          }
+        }
+        elsif ($ctag eq 'Para') {
+          my $p_text = $self->_extract_node_text($child);
+          $p_text =~ s/^\s+|\s+$//g;
+          unless ($p_text =~ /options.*available/i) {
+            push @{$methods{$cur_action}{_paras}}, $p_text;
+          }
+        }
+      }
+    }
+  }
+
+  for my $act (keys %methods) {
+    my $data = $methods{$act};
+    my @paras = @{delete $data->{_paras} || []};
+    if (@paras) {
+      my $full_text = join(' ', @paras);
+      $data->{description} = $full_text;
+      if ($full_text =~ m{^([^.!?\n]+[.!?])}) {
+        $data->{summary} = $1;
+      }
+      else {
+        $data->{summary} = $full_text;
+      }
+    }
+  }
+
+  return $self->{_pod_cache}{$file} = \%methods;
+}
+
+sub _has_auth_bridge {
+  my ($self, $route, $conf) = @_;
+  my $pattern = $conf->{security_bridge_pattern} // qr/(?:ensure_|auth)/i;
+  my $cur = $route->parent;
+  while ($cur) {
+    my $name = $cur->name // '';
+    return 1 if $name =~ $pattern;
+    my $to = $cur->to;
+    if (ref $to eq 'HASH') {
+      my $cb_str = join(' ', grep { defined } values %$to);
+      return 1 if $cb_str =~ $pattern;
+    }
+    $cur = $cur->parent;
+  }
+  return 0;
 }
 
 1;
