@@ -274,7 +274,18 @@ sub _build_operation {
 
   my $base_path = $conf->{base_path};
 
-  # Ensure operationId is unique across methods and shared route names
+  # Route name mapping:
+  # Only assign x-mojo-name if route is NOT nested under an intermediate path bridge.
+  # Otherwise Mojolicious::Plugin::OpenAPI executes add_child($r) which severs intermediate bridges.
+  my $mojo_name;
+  if ($route->name && !$self->_has_intermediate_bridge($route, $base_path)) {
+    my $methods = $route->methods || [];
+    $mojo_name = @$methods > 1 ? $route->name . '_' . $method : $route->name;
+  }
+
+  # operationId is x-mojo-name for a route with a custom name that is not
+  # bridged. Else it is "<method>_<name or path>": the plugin must not find a
+  # bridged route by its name. Automatic route names are not used.
   my $base_id = $route->has_custom_name
     ? $route->name
     : ($clean_path =~ s/[^\w]+/_/gr);
@@ -282,17 +293,20 @@ sub _build_operation {
   $base_id =~ s/_$//;
   $base_id ||= 'operation';
 
-  my $op_id = "${method}_${base_id}";
+  # Ensure operationId is unique across methods and shared route names
+  my $id = ($route->has_custom_name && defined $mojo_name) ? $mojo_name : "${method}_${base_id}";
+  my $op_id = $id;
   my $suffix = 1;
   while ($seen_op_ids->{$op_id}++) {
     $suffix++;
-    $op_id = "${method}_${base_id}_${suffix}";
+    $op_id = "${id}_${suffix}";
   }
 
   my %op = (
     operationId => $op_id,
     responses   => {},
   );
+  $op{'x-mojo-name'} = $mojo_name if defined $mojo_name;
 
   # Set valid response structures (RFC 7231 / RFC 9110 compliant)
   if ($method eq 'delete') {
@@ -312,20 +326,6 @@ sub _build_operation {
   }
   $op{responses}{'400'} = { description => 'Invalid request error' };
   $op{responses}{'500'} = { description => 'Internal server error' };
-
-  # Route name mapping:
-  # Only assign x-mojo-name if route is NOT nested under an intermediate path bridge.
-  # Otherwise Mojolicious::Plugin::OpenAPI executes add_child($r) which severs intermediate bridges.
-  my $is_bridged = $self->_has_intermediate_bridge($route, $base_path);
-  if ($route->name && !$is_bridged) {
-    my $methods = $route->methods || [];
-    if (@$methods > 1) {
-      $op{'x-mojo-name'} = $route->name . '_' . $method;
-    }
-    else {
-      $op{'x-mojo-name'} = $route->name;
-    }
-  }
 
   # Set x-mojo-to if controller/action target exists
   my $to = $route->to;

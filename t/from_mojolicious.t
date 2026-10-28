@@ -124,16 +124,33 @@ subtest 'generate openapi spec from mojolicious routes' => sub {
   ok exists $spec->{paths}{'/metrics'}, '/metrics path exists';
   ok exists $spec->{paths}{'/metrics'}{get}, 'get operation exists';
   ok exists $spec->{paths}{'/metrics'}{post}, 'post operation exists';
-  is $spec->{paths}{'/metrics'}{get}{operationId}, 'get_metrics_collection', 'get operationId disambiguated';
-  is $spec->{paths}{'/metrics'}{post}{operationId}, 'post_metrics_collection', 'post operationId disambiguated';
+  is $spec->{paths}{'/metrics'}{get}{operationId}, 'metrics_collection_get', 'get operationId disambiguated';
+  is $spec->{paths}{'/metrics'}{post}{operationId}, 'metrics_collection_post', 'post operationId disambiguated';
   is $spec->{paths}{'/metrics'}{get}{'x-mojo-name'}, 'metrics_collection_get', 'x-mojo-name disambiguated for GET';
   is $spec->{paths}{'/metrics'}{post}{'x-mojo-name'}, 'metrics_collection_post', 'x-mojo-name disambiguated for POST';
+
+  # Check operationId is the same as x-mojo-name for a named route
+  is $spec->{paths}{'/items/{id}'}{get}{operationId}, 'get_item', 'operationId is route name';
+  is $spec->{paths}{'/items/{id}'}{get}{'x-mojo-name'}, 'get_item', 'x-mojo-name is route name';
 
   # Check DELETE route response (204 No Content has no content body)
   my $del_op = $spec->{paths}{'/items/{id}'}{delete};
   ok $del_op, 'delete operation exists';
   ok exists $del_op->{responses}{'204'}, '204 response exists';
   ok !exists $del_op->{responses}{'204'}{content}, '204 response has NO content body (RFC compliant)';
+};
+
+subtest 'operationId for unnamed and duplicate named routes' => sub {
+  my $app = Mojolicious->new;
+  $app->routes->get('/one')->to(cb => sub { })->name('dup');
+  $app->routes->get('/two')->to(cb => sub { })->name('dup');
+  $app->routes->get('/things/:id')->to(cb => sub { });
+  my $spec = openapi_from(mojolicious => {app => $app, title => 'Ids', version => '1.0.0'});
+
+  is $spec->{paths}{'/one'}{get}{operationId}, 'dup', 'first custom name used as operationId';
+  is $spec->{paths}{'/two'}{get}{operationId}, 'dup_2', 'duplicate custom name gets a suffix';
+  is $spec->{paths}{'/things/{id}'}{get}{operationId}, 'get_things_id', 'unnamed route keeps <method>_<path>';
+  is $spec->{paths}{'/things/{id}'}{get}{'x-mojo-name'}, 'thingsid', 'unnamed route keeps its automatic x-mojo-name';
 };
 
 subtest 'integration with Mojolicious::Plugin::OpenAPI' => sub {
