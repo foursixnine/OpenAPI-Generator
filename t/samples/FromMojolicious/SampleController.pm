@@ -55,6 +55,24 @@ Optional item count.
 
 =back
 
+These fields are returned:
+
+=over 2
+
+=item created (required)
+
+  created => 1
+
+Number of created items.
+
+=item draft
+
+  draft => false
+
+True when the item is a draft (boolean).
+
+=back
+
 =back
 
 =cut

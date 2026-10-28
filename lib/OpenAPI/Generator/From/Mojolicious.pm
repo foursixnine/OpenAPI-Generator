@@ -410,6 +410,23 @@ sub _build_operation {
           }
         }
       }
+
+      my @fields = @{$pod->{fields} || []};
+      my $res_content = $op{responses}{'200'} && $op{responses}{'200'}{content};
+      if (@fields && $res_content) {
+        my $schema = $res_content->{'application/json'}{schema};
+        for my $f (@fields) {
+          my %prop = (type => $f->{type} // 'string');
+          $prop{description} = $f->{description} if defined $f->{description};
+          $prop{example}     = $f->{example}     if defined $f->{example};
+          $schema->{properties}{$f->{name}} //= \%prop;
+          if ($f->{required}) {
+            $schema->{required} //= [];
+            push @{$schema->{required}}, $f->{name}
+              unless grep { $_ eq $f->{name} } @{$schema->{required}};
+          }
+        }
+      }
     }
   }
 
@@ -567,6 +584,7 @@ sub _parse_controller_pod_file {
             summary     => undef,
             description => undef,
             options     => [],
+            fields      => [],
             _paras      => [],
           };
         }
@@ -594,7 +612,7 @@ sub _parse_controller_pod_file {
                 example     => undef,
                 required    => $req,
               };
-              push @{$methods{$cur_action}{options}}, $cur_opt;
+              push @{$methods{$cur_action}{$methods{$cur_action}{_list} // 'options'}}, $cur_opt;
             }
             elsif ($cur_opt && $otag eq 'Verbatim') {
               my $verb = $self->_extract_node_text($opt_node);
@@ -613,6 +631,10 @@ sub _parse_controller_pod_file {
                   $cur_opt->{type} = 'number';
                   $cur_opt->{example} = 0 + $val;
                 }
+                elsif ($val =~ /^(true|false)$/) {
+                  $cur_opt->{type} = 'boolean';
+                  $cur_opt->{example} = $1 eq 'true' ? true : false;
+                }
               }
             }
             elsif ($cur_opt && $otag eq 'Para') {
@@ -622,7 +644,7 @@ sub _parse_controller_pod_file {
               if ($p_text =~ /\b(?:mandatory|required)\b/i && $p_text !~ /\b(?:not\s+(?:mandatory|required)|optional)\b/i) {
                 $cur_opt->{required} = 1;
               }
-              if ($p_text =~ /\b(?:0\s+or\s+1|boolean)\b/i && $cur_opt->{type} ne 'string') {
+              if ($p_text =~ /\b(?:0\s+or\s+1|boolean)\b/i && $cur_opt->{type} !~ /^(?:string|boolean)$/) {
                 $cur_opt->{type} = 'integer';
               }
             }
@@ -631,7 +653,13 @@ sub _parse_controller_pod_file {
         elsif ($ctag eq 'Para') {
           my $p_text = $self->_extract_node_text($child);
           $p_text =~ s/^\s+|\s+$//g;
-          unless ($p_text =~ /options.*available/i) {
+          if ($p_text =~ /fields.*returned/i) {
+            $methods{$cur_action}{_list} = 'fields';
+          }
+          elsif ($p_text =~ /options.*available/i) {
+            $methods{$cur_action}{_list} = 'options';
+          }
+          else {
             push @{$methods{$cur_action}{_paras}}, $p_text;
           }
         }
@@ -641,6 +669,7 @@ sub _parse_controller_pod_file {
 
   for my $act (keys %methods) {
     my $data = $methods{$act};
+    delete $data->{_list};
     my @paras = @{delete $data->{_paras} || []};
     if (@paras) {
       my $full_text = join(' ', @paras);

@@ -40,6 +40,17 @@ subtest 'controller pod parsing directly' => sub {
 
   is $opts_by_name{active}{required}, 1, 'active option recognized as required';
   is $opts_by_name{active}{type}, 'integer', 'active option boolean/0,1 inferred as integer';
+
+  is_deeply $pod->{list}{fields}, [], 'list action has no fields';
+  is_deeply [map { $_->{name} } @{$pod->{create}{options}}], ['name', 'count'], 'create options exclude fields';
+  my %fields = map { $_->{name} => $_ } @{$pod->{create}{fields} || []};
+  is_deeply [sort keys %fields], ['created', 'draft'], 'create action has 2 fields';
+  is $fields{created}{type}, 'integer', 'created field inferred as integer';
+  is $fields{created}{required}, 1, 'created field recognized as required';
+  is $fields{draft}{type}, 'boolean', 'draft field with "boolean" in the description stays boolean';
+  is ref $fields{draft}{example}, 'JSON::PP::Boolean', 'draft example is a JSON boolean';
+  ok !$fields{draft}{example}, 'draft example is false';
+  unlike $pod->{create}{description}, qr/fields.*returned/i, 'fields intro not in description';
 };
 
 subtest 'openapi_from mojolicious with controller POD enrichment' => sub {
@@ -76,6 +87,15 @@ subtest 'openapi_from mojolicious with controller POD enrichment' => sub {
   is $schema->{properties}{name}{example}, 'Sample', 'name property example';
   is $schema->{properties}{count}{type}, 'integer', 'count property inferred as integer';
   is_deeply $schema->{required}, ['name'], 'name is in required list';
+
+  # Verify 200 response schemas from POD fields
+  is_deeply $get_op->{responses}{200}{content}{'application/json'}{schema}, {type => 'object'},
+    'GET response schema stays generic without POD fields';
+  my $res = $post_op->{responses}{200}{content}{'application/json'}{schema};
+  is $res->{type}, 'object', 'POST response schema is an object';
+  is $res->{properties}{created}{type}, 'integer', 'created response property is integer';
+  is $res->{properties}{draft}{type}, 'boolean', 'draft response property is boolean';
+  is_deeply $res->{required}, ['created'], 'created is in response required list';
 
   # Verify Auth bridge and securitySchemes
   ok exists $spec->{paths}{'/auth/secure'}{get}, 'GET /auth/secure exists';
